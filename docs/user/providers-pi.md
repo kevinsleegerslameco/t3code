@@ -54,6 +54,11 @@ installs Pi's example `subagent` extension, T3 Code also shows its task progress
 UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
 threads.
 
+The `pi-subagents` package also exposes its background workflows and nested agents in the shared
+agent view, including status, elapsed time, and the current operation when reported. Background
+completion turns continue in the parent thread. These entries remain read-only; their status
+snapshots do not provide T3 child-thread transcripts or final answers.
+
 ## Troubleshooting
 
 - If Pi is unavailable, confirm that the configured binary runs on the server machine, then refresh

@@ -42,6 +42,76 @@ import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
 
 let renderer: ReactTestRenderer;
 
+it("shows Pi agents without child chats, including activity and settled history", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const agent = {
+    id: "pi-worker",
+    parentNodeId: "root",
+    childThreadId: null,
+    origin: "provider_native",
+    driver: "pi",
+    providerInstanceId: "pi",
+    title: "Issue 278 coder",
+    prompt: "",
+    model: null,
+    status: "running",
+    progress: "edit",
+    result: null,
+    startedAt: DateTime.makeUnsafe("2026-10-07T12:00:00Z"),
+    completedAt: null,
+    updatedAt: DateTime.makeUnsafe("2026-10-07T12:00:00Z"),
+  };
+  const projection = {
+    thread: {
+      id: "parent",
+      lineage: { relationshipToParent: null },
+      activeProviderThreadId: null,
+    },
+    runs: [],
+    providerThreads: [],
+    providerSessions: [],
+    contextTransfers: [],
+    subagents: [agent],
+  };
+  state.projection = projection;
+  const panel = (
+    <ThreadRelationshipsPanel
+      environmentId={EnvironmentId.make("test")}
+      threadId={ThreadId.make("parent")}
+    />
+  );
+  await act(async () => {
+    renderer = create(panel);
+  });
+  const text = () =>
+    renderer.root
+      .findAll((node) => typeof node.type === "string")
+      .flatMap((node) => node.children.filter((child) => typeof child === "string"))
+      .join(" ")
+      .replace(/\s+/g, " ");
+  expect(text()).toContain("Issue 278 coder");
+  expect(text()).toContain("edit");
+  expect(text()).toContain("Lineage · 1 running");
+  expect(
+    renderer.root.findAllByProps({ "aria-label": "Stop subagent Issue 278 coder" }),
+  ).toHaveLength(0);
+  expect(state.navigate).not.toHaveBeenCalled();
+  state.projection = {
+    ...projection,
+    subagents: [
+      { ...agent, status: "completed", completedAt: DateTime.makeUnsafe("2026-10-07T12:02:00Z") },
+    ],
+  };
+  await act(async () => renderer.update(cloneElement(panel)));
+  expect(text()).toContain("Previous Pi agents (1)");
+  expect(text()).not.toContain("Issue 278 coder");
+  await act(async () =>
+    renderer.root.findByProps({ type: "button", "aria-expanded": false }).props.onClick(),
+  );
+  expect(text()).toContain("Issue 278 coder");
+  expect(text()).toContain("Done");
+});
+
 afterEach(async () => {
   await act(async () => renderer?.unmount());
   vi.unstubAllGlobals();

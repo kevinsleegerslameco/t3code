@@ -18,7 +18,6 @@ import {
   orderWebThreadLineageRows,
   resolveMergeBackTargetThreadId,
   type ThreadRelationshipEdge,
-  type ThreadRelationshipWalkRow,
 } from "@t3tools/client-runtime/state/thread-relationships";
 import {
   canDetachThreadProviderSession,
@@ -114,18 +113,17 @@ export function ThreadLineageRowList(props: {
   );
 }
 
-function ThreadLineageGroup(props: {
+function ThreadLineageGroup<Row>(props: {
   readonly label: string | null;
-  readonly rows: ReadonlyArray<ThreadRelationshipWalkRow>;
+  readonly rows: ReadonlyArray<Row>;
   readonly expanded: boolean;
-  readonly children: (rows: ReadonlyArray<ThreadRelationshipWalkRow>) => ReactNode;
+  readonly failedCount?: number;
+  readonly children: (rows: ReadonlyArray<Row>) => ReactNode;
 }) {
   const [expanded, setExpanded] = useState(props.expanded);
   const [visibleCount, setVisibleCount] = useState(THREAD_LINEAGE_INITIAL_COUNT);
   const { visibleRows, hiddenCount } = resolveThreadLineageWindow(props.rows, visibleCount);
-  const failedCount = props.rows.filter(
-    ({ edge }) => edge.status === "failed" || edge.status === "error",
-  ).length;
+  const failedCount = props.failedCount ?? 0;
   if (props.rows.length === 0) return null;
   return (
     <div>
@@ -217,6 +215,26 @@ export function ThreadRelationshipsPanel(props: {
       ),
     [projection?.subagents],
   );
+  const piAgents = useMemo(() => {
+    const agents = (projection?.subagents ?? []).filter(
+      (agent) => agent.childThreadId === null && agent.driver === "pi",
+    );
+    const byId = new Map(agents.map((agent) => [agent.id, agent]));
+    return agents.map((agent) => {
+      let depth = 0;
+      let parent = byId.get(agent.parentNodeId);
+      while (parent && depth < 4) {
+        depth += 1;
+        parent = byId.get(parent.parentNodeId);
+      }
+      return {
+        ...projectedSubagentsToRuntime([agent])[0]!,
+        providerInstanceId: agent.providerInstanceId,
+        driver: agent.driver,
+        depth,
+      };
+    });
+  }, [projection?.subagents]);
   const threadShells = useThreadShells();
   const projects = useProjects().filter((project) => project.environmentId === props.environmentId);
   const archived = useArchivedThreadSnapshots([props.environmentId]);
@@ -273,13 +291,25 @@ export function ThreadRelationshipsPanel(props: {
     { id: "active", label: null, rows: active, expanded: true },
     { id: "previous", label: "Previous agents", rows: previous, expanded: false },
   ];
-  // Subagents without a child thread yet have no row, so count them separately.
+  const activePiAgents = piAgents.filter((agent) =>
+    ["pending", "running", "waiting"].includes(agent.status),
+  );
+  const piGroups = [
+    { id: "pi-active", label: "Pi agents", rows: activePiAgents, expanded: true },
+    {
+      id: "pi-previous",
+      label: "Previous Pi agents",
+      rows: piAgents.filter((agent) => !activePiAgents.includes(agent)),
+      expanded: false,
+    },
+  ];
+  // Native agents may run without a separate T3 child chat.
   const runningCount =
     (projection?.subagents.filter(
       (agent) => agent.childThreadId === null && agent.status === "running",
     ).length ?? 0) + active.filter(({ edge }) => edge.status === "running").length;
 
-  if (relationshipRows.length === 0 && runningCount === 0) {
+  if (relationshipRows.length === 0 && runningCount === 0 && piAgents.length === 0) {
     return null;
   }
 
@@ -365,7 +395,14 @@ export function ThreadRelationshipsPanel(props: {
       }
     >
       {groups.map((group) => (
-        <ThreadLineageGroup key={`${scopedThreadKey(ref)}:${group.id}`} {...group}>
+        <ThreadLineageGroup
+          key={`${scopedThreadKey(ref)}:${group.id}`}
+          {...group}
+          failedCount={
+            group.rows.filter(({ edge }) => edge.status === "failed" || edge.status === "error")
+              .length
+          }
+        >
           {(visibleRows) =>
             visibleRows.map(({ threadId, edge }) => {
               const node = graph.nodes.get(threadId);
@@ -566,6 +603,68 @@ export function ThreadRelationshipsPanel(props: {
                 </li>
               );
             })
+          }
+        </ThreadLineageGroup>
+      ))}
+      {piGroups.map((group) => (
+        <ThreadLineageGroup
+          key={`${scopedThreadKey(ref)}:${group.id}`}
+          {...group}
+          failedCount={group.rows.filter((agent) => agent.status === "failed").length}
+        >
+          {(visibleRows) =>
+            visibleRows.map((agent) => (
+              <li key={agent.id} className="relative flex min-h-8 items-center rounded-lg">
+                <Tooltip>
+                  <TooltipTrigger
+                    delay={200}
+                    render={
+                      <button
+                        type="button"
+                        aria-label={`${agent.title} ${threadRelationshipStatusLabel(agent.status)}`}
+                        className={`flex w-full items-center gap-2 rounded-lg py-1 ${THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS} text-left hover:bg-black/[0.055] dark:hover:bg-white/[0.075]`}
+                        style={{ paddingInlineStart: `${6 + agent.depth * 12}px` }}
+                      />
+                    }
+                  >
+                    <ThreadRelationshipIcon driver={agent.driver} status={agent.status} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium text-foreground/85">
+                        {agent.title}
+                      </span>
+                      {agent.progress ? (
+                        <span className="block truncate text-2xs text-muted-foreground">
+                          {agent.progress}
+                        </span>
+                      ) : null}
+                    </span>
+                    {agent.startedAt ? (
+                      <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+                        <AgentElapsed agent={agent} />
+                      </span>
+                    ) : null}
+                    <span className="shrink-0 text-2xs text-muted-foreground">
+                      {threadRelationshipStatusLabel(agent.status)}
+                    </span>
+                  </TooltipTrigger>
+                  <ThreadHoverCardPopup side="left">
+                    <SubagentTooltipContent
+                      title={agent.title}
+                      model={agent.model}
+                      providerInstanceId={agent.providerInstanceId}
+                      driver={agent.driver}
+                      origin="provider_native"
+                      elapsed={<AgentElapsed agent={agent} />}
+                      status={agent.status}
+                      result={agent.result}
+                      progress={agent.progress}
+                      parentThread={currentThread ?? undefined}
+                      parentProject={currentProject}
+                    />
+                  </ThreadHoverCardPopup>
+                </Tooltip>
+              </li>
+            ))
           }
         </ThreadLineageGroup>
       ))}
