@@ -17,6 +17,7 @@ import {
   type OrchestrationV2ProviderTurn,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -34,6 +35,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as ServerConfig from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as IdAllocator from "../IdAllocator.ts";
+import * as ProviderContinuationRequests from "../ProviderContinuationRequests.ts";
 import {
   ProviderAdapterV2RuntimePolicy,
   type ProviderAdapterV2Event,
@@ -397,6 +399,7 @@ const startTurn = Effect.fnUntraced(function* (
   selection?: ModelSelection,
   runOrdinal = 1,
   threadId = THREAD_ID,
+  continuation = false,
 ) {
   const appThread = yield* makeAppThread(model, threadId);
   const runId = RunId.make(`run:${threadId}:${runOrdinal}`);
@@ -413,8 +416,8 @@ const startTurn = Effect.fnUntraced(function* (
       messageId: `message:${threadId}:${runOrdinal}` as never,
       text,
       attachments,
-      createdBy: "user",
-      creationSource: "web",
+      createdBy: continuation ? "agent" : "user",
+      creationSource: continuation ? "provider" : "web",
     },
     modelSelection: selection ?? modelSelection(model),
     runtimePolicy,
@@ -484,6 +487,195 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect.each([
+    [true, true],
+    [false, true],
+    [false, false],
+  ])(
+    "routes pi-subagents background wake (continuation, already settled: %s)",
+    ([isContinuation, alreadySettled]) =>
+      Effect.gen(function* () {
+        const requests =
+          yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake).pipe(
+          Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+            offer: (request) => Queue.offer(requests, request).pipe(Effect.asVoid),
+            take: Queue.take(requests),
+          }),
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-async",
+          widgetLines: [
+            "PI_SUBAGENT_ASYNC_JSON:" +
+              encodeJsonLine({
+                kind: "pi-subagents.async-status-snapshot",
+                version: 1,
+                runs: [
+                  {
+                    id: "async-278",
+                    kind: "subagent",
+                    label: "coder",
+                    state: "running",
+                    startedAt: 1000,
+                    children: [
+                      {
+                        id: "step:0",
+                        kind: "step",
+                        label: "coder",
+                        state: "running",
+                        activity: { currentTool: "edit" },
+                      },
+                    ],
+                  },
+                ],
+                omitted: { runs: 0, children: 0 },
+              }),
+          ],
+        });
+        const child = yield* takeEvent((event) => event.type === "subagent.updated").pipe(
+          Effect.timeout(Duration.seconds(1)),
+          Effect.provideService(Clock.Clock, Clock.Clock.defaultValue()),
+        );
+        assert.isTrue(child.type === "subagent.updated" && child.subagent.status === "running");
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-async",
+          widgetLines: [
+            "PI_SUBAGENT_ASYNC_JSON:" +
+              encodeJsonLine({
+                kind: "pi-subagents.async-status-snapshot",
+                version: 1,
+                runs: [
+                  {
+                    id: "async-278",
+                    kind: "subagent",
+                    label: "coder",
+                    state: "complete",
+                    startedAt: 1000,
+                    children: [{ id: "step:0", kind: "step", label: "coder", state: "complete" }],
+                  },
+                ],
+              }),
+          ],
+        });
+        const complete = yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
+        );
+        assert.isTrue(
+          complete.type === "subagent.updated" &&
+            child.type === "subagent.updated" &&
+            complete.subagent.id === child.subagent.id,
+        );
+        yield* fake.emit({ type: "agent_start" });
+        const wake = yield* Queue.take(requests);
+        assert.equal(wake.threadId, THREAD_ID);
+        assert.equal(wake.delivery, "adapter_buffered");
+        yield* fake.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+        yield* fake.emit({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: "Child finished.",
+          },
+        });
+        if (alreadySettled) yield* fake.emit({ type: "agent_settled" });
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "Background task completed.",
+          undefined,
+          2,
+          THREAD_ID,
+          isContinuation,
+        );
+        yield* wake.clearIfCurrent!();
+        let staleDispatched = false;
+        yield* wake.dispatchIfCurrent!(
+          Effect.sync(() => {
+            staleDispatched = true;
+          }),
+        );
+        assert.isFalse(staleDispatched);
+        if (!isContinuation) {
+          const prompt = yield* fake.takeRequest("prompt");
+          assert.equal(prompt["streamingBehavior"], "followUp");
+          // Round-trip a session read while Pi has not yet consumed the queued
+          // prompt. A completed buffered wake must not settle that new turn.
+          yield* runtime.readThreadSnapshot({ providerThread });
+          if (!alreadySettled) {
+            yield* fake.emit({ type: "agent_settled" });
+            yield* runtime.readThreadSnapshot({ providerThread });
+          }
+          yield* fake.emit({ type: "agent_start" });
+          yield* fake.emit({ type: "message_start", message: { role: "user", content: [] } });
+          yield* fake.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+          yield* fake.emit({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "text_delta",
+              contentIndex: 0,
+              delta: "Follow-up finished.",
+            },
+          });
+          yield* fake.emit({ type: "agent_settled" });
+        }
+        const answer = yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "assistant_message",
+        );
+        assert.isTrue(
+          answer.type === "turn_item.updated" &&
+            answer.turnItem.type === "assistant_message" &&
+            answer.turnItem.text === "Child finished.",
+        );
+        if (!isContinuation) {
+          yield* takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "assistant_message" &&
+              event.turnItem.text === "Follow-up finished.",
+          ).pipe(
+            Effect.timeout(Duration.seconds(1)),
+            Effect.provideService(Clock.Clock, Clock.Clock.defaultValue()),
+          );
+        }
+        const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(
+          terminal.type === "turn.terminal" &&
+            terminal.runOrdinal === 2 &&
+            terminal.status === "completed",
+        );
+        assert.equal(
+          fake.allRequests().filter((request) => request.type === "prompt").length,
+          isContinuation ? 1 : 2,
+        );
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+        assert.isFalse(
+          yield* runtime.hasPendingBackgroundWorkForThread!({
+            ...providerThread,
+            id: ProviderThreadId.make("unrelated"),
+          }),
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
   it.effect("injects the T3 MCP extension and bearer when a session exists", () =>
     Effect.gen(function* () {
       McpProviderSession.setMcpProviderSession({

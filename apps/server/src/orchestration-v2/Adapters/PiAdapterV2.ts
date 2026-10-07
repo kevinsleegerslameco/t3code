@@ -20,8 +20,8 @@
  * Dialog methods become v2 runtime requests (`confirm` → approval_request,
  * `select`/`input`/`editor` → user_input_request); answers travel back as
  * `extension_ui_response`. `notify` becomes a completed activity item.
- * Terminal-only decoration such as status, widget, title, and editor-text
- * updates has no matching T3 surface and is ignored.
+ * The pi-subagents async status widget becomes tracked native agent rows.
+ * Other terminal-only decoration has no matching T3 surface and is ignored.
  */
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
@@ -71,6 +71,8 @@ import {
 } from "../../provider/PiCommands.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
 import * as IdAllocator from "../IdAllocator.ts";
+import * as ProviderContinuationRequests from "../ProviderContinuationRequests.ts";
+import { readPiSubagentSnapshot } from "./PiSubagentSnapshot.ts";
 import * as ProviderAdapter from "../ProviderAdapter.ts";
 import {
   ProviderAdapterDriverCreateError,
@@ -313,6 +315,8 @@ interface ActivePiTurn {
    * the turn instead.
    */
   sawAgentActivity: boolean;
+  /** A user follow-up must be consumed before a buffered wake can settle its turn. */
+  awaitingQueuedPrompt: boolean;
   /** Only slash-command prompts can complete without starting an agent run. */
   readonly promptMayBeCommandOnly: boolean;
   /** Pi reports context as unknown immediately after compaction; keep its estimate for the meter. */
@@ -372,6 +376,7 @@ export function makePiAdapterV2(
   options: PiAdapterV2Options,
 ): ProviderAdapter.ProviderAdapterV2Shape {
   const { idAllocator } = options;
+  const encodePiJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
   const protocolError = (detail: string, payload?: unknown) =>
     new ProviderAdapter.ProviderAdapterProtocolError({
@@ -389,6 +394,7 @@ export function makePiAdapterV2(
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
       const scope = yield* Effect.scope;
+      const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
       const cwd = input.runtimePolicy.cwd ?? options.serverConfig.cwd;
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
@@ -480,6 +486,12 @@ export function makePiAdapterV2(
       // settled. Until orchestration has a first-class provider-initiated run,
       // stop that runtime before it can execute tools without a timeline owner.
       let unsolicitedActivityDetected = false;
+      let lastTurn: ActivePiTurn | null = null;
+      const backgroundRows = new Map<string, { readonly row: string; readonly active: boolean }>();
+      let wakeEligible = false;
+      let wakeBuffer: PiRpcRecord[] | null = null;
+      let wakeBufferChars = 0;
+      let continuationOffered = false;
       let appliedModel: string | null = null;
       let appliedThinking: string | null = null;
       /** Last thread title synced into pi's session name (`/resume` listing). */
@@ -1124,6 +1136,94 @@ export function makePiAdapterV2(
         }
       });
 
+      const emitSubagentSnapshot = Effect.fnUntraced(function* (event: PiRpcRecord) {
+        const rows = readPiSubagentSnapshot(event);
+        const owner = lastTurn;
+        if (rows === undefined || owner === null) return;
+        const updatedAt = yield* DateTime.now;
+        for (const row of rows) {
+          const active =
+            row.status === "pending" || row.status === "running" || row.status === "waiting";
+          const fingerprint = encodePiJson(row);
+          const previous = backgroundRows.get(row.id);
+          if (previous?.row === fingerprint) continue;
+          if (active || previous?.active === true) wakeEligible = true;
+          backgroundRows.set(row.id, { row: fingerprint, active });
+          const nativeTaskId = `pi-subagents:${row.id}`;
+          const id = idAllocator.derive.nodeFromProviderItem({
+            driver: PI_PROVIDER,
+            nativeItemId: nativeTaskId,
+          });
+          const validTime = (value: number | undefined) =>
+            value !== undefined && Number.isSafeInteger(value) && value >= 0 && value < 8.64e15;
+          const startedAt = validTime(row.startedAt)
+            ? DateTime.makeUnsafe(row.startedAt!)
+            : owner.startedAt;
+          const completedAt = active
+            ? null
+            : validTime(row.endedAt)
+              ? DateTime.makeUnsafe(row.endedAt!)
+              : updatedAt;
+          yield* emit({
+            type: "subagent.updated",
+            driver: PI_PROVIDER,
+            subagent: {
+              id,
+              threadId: owner.turnInput.threadId,
+              runId: owner.turnInput.runId,
+              parentNodeId:
+                row.parentId === null
+                  ? owner.turnInput.rootNodeId
+                  : idAllocator.derive.nodeFromProviderItem({
+                      driver: PI_PROVIDER,
+                      nativeItemId: `pi-subagents:${row.parentId}`,
+                    }),
+              origin: "provider_native",
+              createdBy: "agent",
+              driver: PI_PROVIDER,
+              providerInstanceId: options.instanceId,
+              providerThreadId: owner.turnInput.providerThread.id,
+              childThreadId: null,
+              nativeTaskRef: providerRef(nativeTaskId),
+              prompt: "",
+              title: row.title,
+              model: null,
+              status: row.status,
+              ...(row.progress === undefined ? {} : { progress: row.progress }),
+              result: null,
+              startedAt,
+              completedAt,
+              updatedAt,
+            },
+          });
+          yield* emit({
+            type: "turn_item.updated",
+            driver: PI_PROVIDER,
+            turnItem: {
+              ...baseItemFields(owner, nativeTaskId, startedAt, updatedAt),
+              type: "subagent",
+              subagentId: id,
+              origin: "provider_native",
+              driver: PI_PROVIDER,
+              providerInstanceId: options.instanceId,
+              childThreadId: null,
+              prompt: "",
+              title: row.title,
+              status: row.status,
+              completedAt,
+              result: null,
+              ...(row.progress === undefined ? {} : { progress: row.progress }),
+            },
+          });
+        }
+        // Keep only a bounded terminal history; running work is never inferred
+        // complete because a bounded snapshot omitted it.
+        for (const [id, value] of backgroundRows) {
+          if (backgroundRows.size <= 200) break;
+          if (!value.active) backgroundRows.delete(id);
+        }
+      });
+
       // ── extension UI prompts ──────────────────────────────
 
       const cancelPrompt = (pending: PendingPiPrompt, resolvedAt: DateTime.Utc) =>
@@ -1557,9 +1657,50 @@ export function makePiAdapterV2(
       const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
         const state = threadState;
         const turn = state?.activeTurn ?? null;
+        if (readPiSubagentSnapshot(event) !== undefined) {
+          yield* emitSubagentSnapshot(event);
+          return;
+        }
+        if (turn === null && wakeBuffer !== null) {
+          wakeBufferChars += encodePiJson(event).length;
+          if (wakeBuffer.length >= 2_000 || wakeBufferChars > 8 * 1024 * 1024) {
+            unsolicitedActivityDetected = true;
+            yield* updateProviderSession(
+              "error",
+              "Pi background continuation exceeded its buffer limit.",
+            );
+            yield* connection.terminate;
+          } else wakeBuffer.push(event);
+          return;
+        }
         switch (event["type"]) {
           case "agent_start": {
             if (turn === null) {
+              if (wakeEligible && state !== null && lastTurn !== null && !stopRequested) {
+                wakeEligible = false;
+                const offeredBuffer = [event];
+                wakeBuffer = offeredBuffer;
+                wakeBufferChars = encodePiJson(event).length;
+                continuationOffered = true;
+                yield* continuationRequests.offer({
+                  threadId: lastTurn.turnInput.threadId,
+                  providerThreadId: state.providerThread.id,
+                  driver: PI_PROVIDER,
+                  detail: "Pi subagent background work resumed.",
+                  delivery: "adapter_buffered",
+                  dispatchIfCurrent: (effect) =>
+                    wakeBuffer === offeredBuffer ? effect.pipe(Effect.asSome) : Effect.succeedNone,
+                  clearIfCurrent: () =>
+                    Effect.gen(function* () {
+                      if (wakeBuffer !== offeredBuffer) return;
+                      wakeBuffer = null;
+                      continuationOffered = false;
+                      stopRequested = true;
+                      yield* connection.terminate;
+                    }),
+                });
+                return;
+              }
               unsolicitedActivityDetected = true;
               yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
               yield* connection.terminate;
@@ -1570,6 +1711,10 @@ export function makePiAdapterV2(
             return;
           }
           case "message_start": {
+            if (turn !== null && recordString(event["message"], "role") === "user") {
+              turn.awaitingQueuedPrompt = false;
+              turn.settleProbeGeneration += 1;
+            }
             if (turn !== null && recordString(event["message"], "role") === "assistant") {
               turn.sawAgentActivity = true;
               turn.messageOrdinal += 1;
@@ -1780,6 +1925,7 @@ export function makePiAdapterV2(
             return;
           }
           case "agent_settled": {
+            if (turn?.awaitingQueuedPrompt === true && !turn.interrupted) return;
             if (turn?.interrupted === true) {
               if (state !== null) yield* finalizeTurn(state);
               return;
@@ -1837,6 +1983,11 @@ export function makePiAdapterV2(
             const responseTurn =
               pendingPrompt?.providerTurnId === turn?.providerTurn.id ? turn : null;
             if (event["success"] === true) {
+              if (responseTurn?.awaitingQueuedPrompt && responseTurn.promptMayBeCommandOnly) {
+                responseTurn.awaitingQueuedPrompt = false;
+                yield* scheduleSettleProbe(responseTurn, true);
+                return;
+              }
               // Deferred success ack. Command-only prompts (pure extension
               // slash commands) never start an agent run and never emit
               // `agent_settled`, so probe for idleness. The probe result is
@@ -1895,6 +2046,7 @@ export function makePiAdapterV2(
             const attempt = Math.max(1, Math.trunc(recordNumber(event, "attempt") ?? 1));
             if (
               turn === null ||
+              turn.awaitingQueuedPrompt ||
               turn.providerTurn.id !== event["providerTurnId"] ||
               turn.settleProbeGeneration !== event["settleProbeGeneration"] ||
               (!settleAfterAgentActivity && turn.sawAgentActivity) ||
@@ -2219,6 +2371,15 @@ export function makePiAdapterV2(
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
+        hasPendingBackgroundWork: Effect.sync(
+          () => continuationOffered || [...backgroundRows.values()].some((row) => row.active),
+        ),
+        hasPendingBackgroundWorkForThread: (providerThread) =>
+          Effect.sync(
+            () =>
+              providerThread.id === threadState?.providerThread.id &&
+              (continuationOffered || [...backgroundRows.values()].some((row) => row.active)),
+          ),
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
           const slug =
@@ -2307,9 +2468,14 @@ export function makePiAdapterV2(
             // extension's before_agent_start system-prompt hook, never by
             // wrapping the user text: a wrapped first message would no
             // longer start with "/" and slash commands would stop expanding.
-            const compactCommand = parsePiCompactCommand(turnInput.message.text);
+            const isContinuation =
+              turnInput.message.createdBy === "agent" &&
+              turnInput.message.creationSource === "provider";
+            const compactCommand = isContinuation
+              ? null
+              : parsePiCompactCommand(turnInput.message.text);
             const payload =
-              compactCommand === null
+              compactCommand === null && !isContinuation
                 ? yield* resolvePromptPayload(turnInput.message.text, turnInput.message.attachments)
                 : null;
             const startedAt = yield* DateTime.now;
@@ -2340,6 +2506,7 @@ export function makePiAdapterV2(
               toolStartedAt: new Map(),
               interrupted: false,
               sawAgentActivity: false,
+              awaitingQueuedPrompt: payload !== null && wakeBuffer !== null,
               promptMayBeCommandOnly:
                 compactCommand !== null || (payload?.message.trimStart().startsWith("/") ?? false),
               latestCompactionAfterTokens: null,
@@ -2358,6 +2525,7 @@ export function makePiAdapterV2(
             // and answered instead of deadlocking the caller.
             yield* Effect.gen(function* () {
               state.activeTurn = activeTurn;
+              lastTurn = activeTurn;
               if (compactCommand !== null) {
                 yield* connection.send(compactRpcRecord(compactCommand));
                 pendingCompactResponses.push({
@@ -2369,6 +2537,10 @@ export function makePiAdapterV2(
                   type: "prompt",
                   message: payload.message,
                   ...(payload.images.length === 0 ? {} : { images: payload.images }),
+                  // A user message can win the race with the offered wake. Pi
+                  // queues it after its current work; this run adopts that
+                  // work's buffered events instead of prompting while streaming.
+                  ...(wakeBuffer === null ? {} : { streamingBehavior: "followUp" }),
                 });
                 pendingPromptResponses.push({
                   providerTurnId: providerTurn.id,
@@ -2389,6 +2561,20 @@ export function makePiAdapterV2(
               yield* updateProviderSession("running", null);
               if (outOfTurnExtensionErrors.length > 0) {
                 yield* Queue.offer(connection.events, { type: "t3.flush_extension_errors" });
+              }
+              if (isContinuation || wakeBuffer !== null) {
+                const buffered = wakeBuffer ?? [];
+                wakeBuffer = null;
+                wakeBufferChars = 0;
+                continuationOffered = false;
+                for (const event of buffered) {
+                  // The wake belongs to this run, but its old settlement does
+                  // not finish a user prompt Pi has yet to consume.
+                  if (payload !== null && event["type"] === "agent_settled") continue;
+                  yield* handleSessionEvent(event);
+                }
+                if (payload !== null) activeTurn.awaitingQueuedPrompt = true;
+                if (isContinuation && buffered.length === 0) yield* finalizeTurn(state);
               }
             }).pipe(
               sessionEventPermit.withPermits(1),
@@ -2476,9 +2662,18 @@ export function makePiAdapterV2(
         interruptTurn: (interruptInput) =>
           Effect.gen(function* () {
             const turn = threadState?.activeTurn ?? null;
-            // Stop on a settled turn: Pi runs nothing between prompts, so
-            // nothing of that turn is left to stop.
-            if (turn === null && interruptInput.requestRuntimeRestart === true) return;
+            // A settled foreground turn can still own pi-subagents work.
+            if (turn === null && interruptInput.requestRuntimeRestart === true) {
+              if (continuationOffered || [...backgroundRows.values()].some((row) => row.active)) {
+                stopRequested = true;
+                wakeEligible = false;
+                wakeBuffer = null;
+                continuationOffered = false;
+                backgroundRows.clear();
+                yield* connection.terminate;
+              }
+              return;
+            }
             if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
               return yield* protocolError(`Pi turn ${interruptInput.providerTurnId} is not active`);
             }
