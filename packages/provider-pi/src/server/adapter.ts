@@ -17,6 +17,7 @@ import {
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2RuntimeRequest,
+  type OrchestrationV2Subagent,
   type OrchestrationV2TurnItem,
   type OrchestrationV2UserInputQuestion,
   type ProviderApprovalDecision,
@@ -1075,39 +1076,25 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         resultRecord: unknown,
         completed: boolean,
       ) {
-        const results = recordField(recordField(resultRecord, "details"), "results");
-        if (!Array.isArray(results)) return;
+        const details = recordField(resultRecord, "details");
+        const tasks = [
+          ...piResultTasks(toolCallId, details, completed),
+          ...piWorkflowChildTasks(toolCallId, details),
+        ];
+        if (tasks.length === 0) return;
         const emittedAt = yield* DateTime.now;
         const parentNodeId = idAllocator.derive.nodeFromProviderItem({
           driver: PI_PROVIDER,
           nativeItemId: toolCallId,
         });
-        for (const [index, result] of results.entries()) {
-          const agent = recordString(result, "agent");
-          const task = recordString(result, "task");
-          if (agent === undefined || task === undefined) continue;
-          const nativeTaskId = `${toolCallId}:subagent:${recordNumber(result, "step") ?? index}`;
+        for (const { nativeTaskId, agent, task, model, status, outputText } of tasks) {
           const subagentId = idAllocator.derive.nodeFromProviderItem({
             driver: PI_PROVIDER,
             nativeItemId: nativeTaskId,
           });
           const startedAt = turn.toolStartedAt.get(nativeTaskId) ?? emittedAt;
           turn.toolStartedAt.set(nativeTaskId, startedAt);
-          const finished = completed || recordField(result, "finished") === true;
-          const stopReason = recordString(result, "stopReason");
-          const interrupted = finished && stopReason === "aborted";
-          const failed =
-            finished &&
-            !interrupted &&
-            ((recordNumber(result, "exitCode") ?? 0) !== 0 || stopReason === "error");
-          const status = interrupted
-            ? "interrupted"
-            : failed
-              ? "failed"
-              : finished
-                ? "completed"
-                : "running";
-          const outputText = piSubagentOutput(result);
+          const finished = PI_FINISHED_SUBAGENT_STATUSES.has(status);
           const progress =
             !finished && outputText.length > 0 ? { progress: outputText.slice(0, 200) } : {};
           const resultText = finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null;
@@ -1128,7 +1115,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               nativeTaskRef: providerRef(nativeTaskId),
               prompt: task,
               title: agent,
-              model: recordString(result, "model") ?? null,
+              model,
               status,
               ...progress,
               result: resultText,
@@ -3143,6 +3130,102 @@ function piRollbackForkEntry(input: {
   if (ref == null) return null;
   if (ref.strength !== "strong" || ref.nativeId === null) return undefined;
   return ref.nativeId;
+}
+
+interface PiSubagentTask {
+  readonly nativeTaskId: string;
+  readonly agent: string;
+  readonly task: string;
+  readonly model: string | null;
+  readonly status: OrchestrationV2Subagent["status"];
+  /** Progress while running, the result once finished. */
+  readonly outputText: string;
+}
+
+const PI_FINISHED_SUBAGENT_STATUSES: ReadonlySet<OrchestrationV2Subagent["status"]> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+
+function piResultTasks(
+  toolCallId: string,
+  details: unknown,
+  completed: boolean,
+): ReadonlyArray<PiSubagentTask> {
+  const results = recordField(details, "results");
+  if (!Array.isArray(results)) return [];
+  return results.flatMap((result, index) => {
+    const agent = recordString(result, "agent");
+    const task = recordString(result, "task");
+    if (agent === undefined || task === undefined) return [];
+    const finished = completed || recordField(result, "finished") === true;
+    const stopReason = recordString(result, "stopReason");
+    const interrupted = finished && stopReason === "aborted";
+    const failed =
+      finished &&
+      !interrupted &&
+      ((recordNumber(result, "exitCode") ?? 0) !== 0 || stopReason === "error");
+    return [
+      {
+        nativeTaskId: `${toolCallId}:subagent:${recordNumber(result, "step") ?? index}`,
+        agent,
+        task,
+        model: recordString(result, "model") ?? null,
+        status: interrupted
+          ? "interrupted"
+          : failed
+            ? "failed"
+            : finished
+              ? "completed"
+              : "running",
+        outputText: piSubagentOutput(result),
+      },
+    ];
+  });
+}
+
+// A child that detached to contact its supervisor has left the workflow and
+// reports no further state on this row.
+const PI_WORKFLOW_CHILD_STATUSES: Readonly<Record<string, OrchestrationV2Subagent["status"]>> = {
+  pending: "pending",
+  running: "running",
+  completed: "completed",
+  failed: "failed",
+  rejected: "failed",
+  paused: "idle",
+  stopped: "interrupted",
+  detached: "interrupted",
+};
+
+/**
+ * pi-subagents reports a workflow's children in `details.workflowChildren`
+ * rather than `details.results`. Older releases leave a background child's
+ * agent out until it settles, so its child id stands in.
+ */
+function piWorkflowChildTasks(toolCallId: string, details: unknown): ReadonlyArray<PiSubagentTask> {
+  const children = recordField(recordField(details, "workflowChildren"), "children");
+  if (!Array.isArray(children)) return [];
+  return children.flatMap((child) => {
+    const childId = recordString(child, "childId");
+    const state = recordString(child, "state");
+    if (childId === undefined || state === undefined) return [];
+    const status = Object.hasOwn(PI_WORKFLOW_CHILD_STATUSES, state)
+      ? PI_WORKFLOW_CHILD_STATUSES[state]
+      : undefined;
+    if (status === undefined) return [];
+    return [
+      {
+        nativeTaskId: `${toolCallId}:workflow:${childId}`,
+        agent: recordString(child, "agent") ?? childId,
+        task: "",
+        model: recordString(child, "model") ?? null,
+        status,
+        outputText: recordString(recordField(child, "activity"), "currentTool") ?? "",
+      },
+    ];
+  });
 }
 
 function piSubagentOutput(result: unknown): string {

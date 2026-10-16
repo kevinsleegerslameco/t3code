@@ -2265,6 +2265,108 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("shows pi-subagents workflow children as subagents of the workflow call", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const workflowDetails = (
+        workflowState: string,
+        children: ReadonlyArray<Record<string, unknown>>,
+      ) => ({
+        mode: "workflow",
+        results: [],
+        workflowChildren: {
+          version: 1,
+          parentToolCallId: "call_wf",
+          workflowRunId: "wf-1",
+          inventoryComplete: workflowState !== "running",
+          workflowState,
+          children,
+        },
+      });
+      yield* fake.emit({
+        type: "tool_execution_update",
+        toolCallId: "call_wf",
+        toolName: "subagent",
+        partialResult: {
+          content: [{ type: "text", text: "(running...)" }],
+          details: workflowDetails("running", [
+            {
+              childId: "scan",
+              state: "running",
+              agent: "scout",
+              model: "openai/gpt-6-luna",
+              activity: { currentTool: "bash" },
+            },
+            { childId: "review", state: "running", agent: "reviewer", runId: "run-review" },
+          ]),
+        },
+      });
+      const scout = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.title === "scout",
+      );
+      assert.isTrue(
+        scout.type === "subagent.updated" &&
+          scout.subagent.status === "running" &&
+          scout.subagent.model === "openai/gpt-6-luna" &&
+          scout.subagent.progress === "bash" &&
+          scout.subagent.childThreadId === null,
+      );
+      const reviewer = yield* takeEvent(
+        (event) => event.type === "subagent.updated" && event.subagent.title === "reviewer",
+      );
+      assert.isTrue(
+        scout.type === "subagent.updated" &&
+          reviewer.type === "subagent.updated" &&
+          reviewer.subagent.status === "running" &&
+          reviewer.subagent.parentNodeId === scout.subagent.parentNodeId,
+      );
+
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_wf",
+        toolName: "subagent",
+        isError: false,
+        result: {
+          content: [{ type: "text", text: "workflow done" }],
+          details: workflowDetails("completed", [
+            { childId: "scan", state: "completed", agent: "scout" },
+            { childId: "review", state: "failed", agent: "reviewer", runId: "run-review" },
+          ]),
+        },
+      });
+      const scoutDone = yield* takeEvent(
+        (event) =>
+          event.type === "subagent.updated" &&
+          event.subagent.title === "scout" &&
+          event.subagent.status === "completed",
+      );
+      const reviewerDone = yield* takeEvent(
+        (event) =>
+          event.type === "subagent.updated" &&
+          event.subagent.title === "reviewer" &&
+          event.subagent.status === "failed",
+      );
+      assert.isTrue(
+        scout.type === "subagent.updated" &&
+          reviewer.type === "subagent.updated" &&
+          scoutDone.type === "subagent.updated" &&
+          scoutDone.subagent.id === scout.subagent.id &&
+          scoutDone.subagent.completedAt !== null &&
+          reviewerDone.type === "subagent.updated" &&
+          reviewerDone.subagent.id === reviewer.subagent.id,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("persists edit patches and write content on file change items", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
